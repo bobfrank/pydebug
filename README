@@ -1,0 +1,6 @@
+To use in your code, add the following to your code:
+   import debug
+
+To actually debug your code:
+   $ python debug.py PID
+
