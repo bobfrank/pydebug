@@ -1,4 +1,3 @@
-#http://www.ofb.net/gnu/gdb/gdb_47.html
 from __future__ import with_statement
 import os
 import sys
@@ -12,11 +11,12 @@ import uuid
 import socket
 import base64
 import select
+import contextlib
 try:
     import _thread
 except ImportError:
     import thread as _thread
-import contextlib
+
 @contextlib.contextmanager
 def suspend_other_threads():
     orig_checkinterval = sys.getcheckinterval()
@@ -26,9 +26,11 @@ def suspend_other_threads():
         yield None
     finally:
         sys.setcheckinterval(orig_checkinterval)
+
 runnable_commands = {}
 def command(fn):
     runnable_commands[fn.__name__] = fn
+
 def get_frame(state):
     frame = sys._current_frames()[state['thread']]
     up = state['up']-1
@@ -36,12 +38,14 @@ def get_frame(state):
         frame = frame.f_back
         up -= 1
     return frame
+
 @command
 def bt(state):
     reload(sys)
     stacks = traceback.format_stack(sys._current_frames()[state['thread']])
     stacks = ['%s%s'%(['  ','**'][len(stacks)-1-state['up']==i], x[2:]) for i,x in enumerate(stacks)]
     return '\n'.join(stacks)
+
 @command
 def allbt(state):
     reload(sys)
@@ -52,27 +56,34 @@ def allbt(state):
         stacks = traceback.format_stack(frame)
         result += '-------- Thread %s\n%s\n'%(tid,'\n'.join(stacks))
     return result
+
 @command
 def thbt(state, thread):
     reload(sys)
     stacks = traceback.format_stack(sys._current_frames()[thread])
-    stacks = ['%s%s'%(['  ','**'][len(stacks)-1-state['up']==i], x[2:]) for i,x in enumerate(stacks)]
+    stacks = [repr(x) for i,x in enumerate(stacks)]
     return '\n'.join(stacks)
+
 @command
 def threads(state):
     frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident()]
     return '\n'.join(frames)
+
 @command
 def get_thread(state):
     return state['thread']
+
 @command
 def set_thread(state, thread):
     frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident()]
     if thread not in frames:
         return 'Error: No such thread'
     else:
+        state['up'] = 0
+        state['line'] = None
         state['thread'] = int(thread)
         return 'Switched to thread %s'%thread
+
 @command
 def up(state):
     state['up'] += 1
@@ -81,44 +92,71 @@ def up(state):
         state['up'] -= 1
         return 'Error: Nothing higher'
     else:
+        state['line'] = None
         return '\n'.join(traceback.format_stack(frame, 1))
+
 @command
 def down(state):
     if state['up'] > 0:
         state['up'] -= 1
         frame = get_frame(state)
+        state['line'] = None
         return '\n'.join(traceback.format_stack(frame, 1))
     else:
         return 'Error: Nothing lower'
+
+def get_variable(state, variable):
+    frame = get_frame(state)
+    var_names = variable.split('.')
+    if var_names[0] in frame.f_locals:
+        res = frame.f_locals[var_names[0]]
+    elif var_names[0] in frame.f_globals:
+        res = frame.f_globals[var_names[0]]
+    else:
+        raise RuntimeError('Error: couldnt find variable "%s" in scope'%variable)
+    for name in var_names[1:]:
+        res = getattr(res, name)
+    return res
+
 @command
 def printv(state, variable):
-    frame = get_frame(state)
-    if variable in frame.f_locals:
-        return repr(frame.f_locals[variable])
-    elif variable in frame.f_globals:
-        return repr(frame.f_globals[variable])
-    else:
-        return 'Error: couldnt find variable "%s" in scope'%variable
+    return repr(get_variable(state,variable))
+
+@command
+def get_dir(state, variable):
+    return repr(dir(get_variable(state,variable)))
+
 @command
 def get_locals(state):
     frame = get_frame(state)
     return '\n'.join(frame.f_locals.keys())
+
 @command
 def get_globals(state):
     frame = get_frame(state)
     return '\n'.join(frame.f_globals.keys())
+
 @command
-def get_list(state):
+def get_list(state, line):
     frame = get_frame(state)
     lines = open(frame.f_code.co_filename).readlines()
-    line_no = frame.f_lineno
-    if line_no < 5:
+    if line == '-' and state['line'] is not None:
+        state['line'] = max(state['line']-10, 0)
+    elif line != '':
+        state['line'] = int(line)
+    elif state['line'] is None:
+    	state['line'] = frame.f_lineno
+    else:
+        state['line'] = min(state['line']+10, len(lines)-6)
+
+    if state['line'] < 5:
         min_line_no = 0
         max_line_no = min(len(lines)-1,10)
     else:
-        min_line_no = line_no-5
-        max_line_no = min(len(lines)-1,line_no+5)
+        min_line_no = state['line']-5
+        max_line_no = min(len(lines)-1,state['line']+5)
     return ''.join(['%5i %s'%(i+1,lines[i]) for i in xrange(min_line_no,max_line_no)])
+
 def only_thread():
     other_threads = [x[1] for x in sys._current_frames().items() if x[0] != _thread.get_ident()]
     out = len(other_threads) == 0
@@ -131,8 +169,9 @@ def only_thread():
         if top.f_code.co_name == '_exitfunc':
             return True
     return out
+
 def handle_particular_user(conn,parent_thread,parent_thread_tid):
-    state = {'thread': parent_thread_tid, 'up': 0}
+    state = {'thread': parent_thread_tid, 'up': 0, 'line': None}
     poll = select.poll()
     poll.register(conn, select.POLLIN)
     request_pending = ''
@@ -157,12 +196,16 @@ def handle_particular_user(conn,parent_thread,parent_thread_tid):
                     conn.send(out_enc)
                     return
                 if cmd in runnable_commands:
-                    output = runnable_commands[cmd](state, *args,**kwds)
+                    try:
+                        output = runnable_commands[cmd](state, *args,**kwds)
+                    except:
+                        output = traceback.format_exc()
             out_enc = '%s\n'%base64.b64encode(pickle.dumps(output))
             conn.send(out_enc)
+
 def cmd_server(parent_thread, parent_thread_tid):
     mypid = os.getpid()
-    path = '/mnt/tmp/py.debug.%s'%mypid
+    path = '/tmp/py.debug.%s'%mypid
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.bind(path)
@@ -181,15 +224,20 @@ def cmd_server(parent_thread, parent_thread_tid):
                         pass
     finally:
         os.unlink(path)
+
 class DebugShell(cmd.Cmd):
     """Command line for debugging attached pid process"""
+
+    prompt = '(py.debug) '
+
     def __init__(self, pid):
         self.pid  = pid
         self.conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.conn.connect('/mnt/tmp/py.debug.%s'%self.pid)
+        self.conn.connect('/tmp/py.debug.%s'%self.pid)
         self.poll = select.poll()
         self.poll.register(self.conn, select.POLLIN)
         cmd.Cmd.__init__(self)
+
     def client_handle_request(self, command, *args, **kwds):
         request = {'command': command, 'args': args, 'kwds': kwds}
         req_enc = '%s\n'%base64.b64encode(pickle.dumps(request))
@@ -203,6 +251,7 @@ class DebugShell(cmd.Cmd):
                     break
                 request_pending += data
         return pickle.loads(base64.b64decode(request_pending.split('\n')[0]))
+
     def do_bt(self,line):
         if line.strip() == '':
             print self.client_handle_request('bt')
@@ -210,38 +259,49 @@ class DebugShell(cmd.Cmd):
             print self.client_handle_request('allbt')
         else:
             print self.client_handle_request('thbt',int(line))
+
     def do_threads(self, line):
         print self.client_handle_request('threads')
+
     def do_thr(self, line):
         if line.strip() == '':
             print self.client_handle_request('get_thread')
         else:
             print self.client_handle_request('set_thread',line.strip())
+
     def do_up(self, line):
         print self.client_handle_request('up')
+
     def do_down(self, line):
         print self.client_handle_request('down')
+
     def do_p(self, name):
         print self.client_handle_request('printv',name)
+
     def do_print(self, name):
         print self.client_handle_request('printv',name)
+
+    def do_dir(self, name):
+        print self.client_handle_request('get_dir',name)
+
     def do_locals(self, line):
         print self.client_handle_request('get_locals')
+
     def do_globals(self, line):
         print self.client_handle_request('get_globals')
+
     def do_list(self, line):
-        print self.client_handle_request('get_list')
+        print self.client_handle_request('get_list',line),
+
     def do_EOF(self, line):
         self.client_handle_request('exit')
         return True
-def client_debug():
+
+if __name__ == '__main__':
     if len(sys.argv) != 2:
         print >>sys.stderr, 'Usage: %s pid'%sys.argv[0]
-        return
     else:
         DebugShell(sys.argv[1]).cmdloop()
-if __name__ == '__main__':
-    client_debug()
 else:
     global debug__has_loaded_thread
     try:
