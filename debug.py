@@ -11,7 +11,9 @@ import uuid
 import socket
 import base64
 import select
+import ctypes 
 import contextlib
+import inspect
 try:
     import _thread
 except ImportError:
@@ -21,11 +23,12 @@ except ImportError:
 def suspend_other_threads():
     orig_checkinterval = sys.getcheckinterval()
     try:
-        sys.setcheckinterval(orig_checkinterval+100) # in case we lose control right after setting this
-        sys.setcheckinterval(2**31-1) #TODO this should be blocking, but wont be in this case
+#        sys.setcheckinterval(orig_checkinterval+100) # in case we lose control right after setting this
+#        sys.setcheckinterval(2**31-1) #TODO this should be blocking, but wont be in this case
         yield None
     finally:
-        sys.setcheckinterval(orig_checkinterval)
+#        sys.setcheckinterval(orig_checkinterval)
+        pass
 
 runnable_commands = {}
 def command(fn):
@@ -104,6 +107,19 @@ def down(state):
         return '\n'.join(traceback.format_stack(frame, 1))
     else:
         return 'Error: Nothing lower'
+ 
+def _async_raise(tid, exctype):
+    """raises the exception, performs cleanup if needed"""
+    if not inspect.isclass(exctype):
+        raise TypeError("Only types can be raised (not instances)")
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), ctypes.py_object(exctype))
+    if res == 0:
+        raise ValueError("invalid thread id")
+    elif res != 1:
+        # """if it returns a number greater than one, you're in trouble, 
+        # and you should call it again with exc=NULL to revert the effect"""
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), None)
+        raise SystemError("PyThreadState_SetAsyncExc failed")
 
 def get_variable(state, variable):
     frame = get_frame(state)
@@ -112,11 +128,18 @@ def get_variable(state, variable):
         res = frame.f_locals[var_names[0]]
     elif var_names[0] in frame.f_globals:
         res = frame.f_globals[var_names[0]]
+    elif var_names[0] in dir(frame.f_globals['__builtins__']):
+        res = getattr(frame.f_globals['__builtins__'],var_names[0])
     else:
         raise RuntimeError('Error: couldnt find variable "%s" in scope'%variable)
     for name in var_names[1:]:
         res = getattr(res, name)
     return res
+
+@command
+def throw(state, variable):
+    _async_raise(state['thread'], get_variable(state, variable))
+    return 'Asynchronously raising an exception of type %s'%variable
 
 @command
 def printv(state, variable):
@@ -275,6 +298,9 @@ class DebugShell(cmd.Cmd):
     def do_down(self, line):
         print self.client_handle_request('down')
 
+    def do_raise(self, line):
+        print self.client_handle_request('throw', line)
+
     def do_p(self, name):
         print self.client_handle_request('printv',name)
 
@@ -303,6 +329,7 @@ if __name__ == '__main__':
     else:
         DebugShell(sys.argv[1]).cmdloop()
 else:
+    print 'main thread ident=',_thread.get_ident()
     global debug__has_loaded_thread
     try:
         x = debug__has_loaded_thread
