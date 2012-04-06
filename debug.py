@@ -19,17 +19,6 @@ try:
 except ImportError:
     import thread as _thread
 
-@contextlib.contextmanager
-def suspend_other_threads():
-    orig_checkinterval = sys.getcheckinterval()
-    try:
-#        sys.setcheckinterval(orig_checkinterval+100) # in case we lose control right after setting this
-#        sys.setcheckinterval(2**31-1) #TODO this should be blocking, but wont be in this case
-        yield None
-    finally:
-#        sys.setcheckinterval(orig_checkinterval)
-        pass
-
 runnable_commands = {}
 def command(fn):
     runnable_commands[fn.__name__] = fn
@@ -163,6 +152,7 @@ def get_globals(state):
 def get_list(state, line):
     frame = get_frame(state)
     lines = open(frame.f_code.co_filename).readlines()
+
     if line == '-' and state['line'] is not None:
         state['line'] = max(state['line']-10, 0)
     elif line != '':
@@ -182,23 +172,108 @@ def get_list(state, line):
 
 def only_thread():
     other_threads = [x[1] for x in sys._current_frames().items() if x[0] != _thread.get_ident()]
-    out = len(other_threads) == 0
     if len(other_threads) == 1:
         top = other_threads[0]
         back = top.f_back
         while back:
             top  = back
             back = top.f_back
-        if top.f_code.co_name == '_exitfunc':
-            return True
-    return out
+        return (top.f_code.co_name == '_exitfunc')
+    else:
+        return (len(other_threads) == 0)
+
+def set_max_ticks_remaining():
+    # sys.setcheckinterval() doesn't cut it -- read ceval.c to see details
+    # I only noticed this being reset in Py_AddPendingCall and after it decrements down to 0
+    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))[0]
+    _Py_Ticker = 2**31-1
+
+def run_next_command(state):
+    # note that we run to the next command only for the selected thread, others have to run just some number of ticks
+    state['up'] = 0
+    frame = get_frame(state)
+    saved_breaks = state['breaks']
+    try:
+        state['breaks'] = [(frame.f_code.co_filename,frame.f_lineno)]
+        continue_threads(state)
+    finally:
+        state['breaks'] = saved_breaks
+
+def tracefunc(state, frame, what, arg):
+    print >>sys.stdout, 'state=',state,'frame=',frame,'what=',what,'arg=',arg
+    print (frame.f_code.co_filename,frame.f_lineno, frame.f_code.co_name)
+    sys.stdout.flush()
+    return 0
+
+def setup_thread_tracer(state, setting):
+    interp = ctypes.pythonapi.PyInterpreterState_Head()
+    t      = ctypes.pythonapi.PyInterpreterState_ThreadHead(interp)
+    while t != 0:
+        t_p = ctypes.cast(t,ctypes.POINTER(PyThreadState))[0]
+        if t_p.thread_id != _thread.get_ident():
+            if setting:
+                print 'setting tracefunc for',t_p
+                print t_p.use_tracing
+                print t_p.tracing
+                t_p.c_tracefunc = Py_tracefunc(tracefunc)
+                t_p.c_traceobj  = state
+                t_p.use_tracing = 1
+                t_p.tracing     = 0
+            else:
+                print 'clearing tracefunc for',t_p
+                t_p.use_tracing = 0
+        t = ctypes.pythonapi.PyThreadState_Next(t)
+
+global __pydebug_breakpoint_hit
+
+@command
+def continue_threads(state):
+    global __pydebug_breakpoint_hit
+    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))[0]
+    __pydebug_breakpoint_hit = False
+    try:
+        setup_thread_tracer(state, True)
+        while not __pydebug_breakpoint_hit and not only_thread():
+            _Py_Ticker = 0    #switch to another thread
+            _Py_Ticker = 1000
+        _Py_Ticker = 2**31-1
+    finally:
+        setup_thread_tracer(state, False)
+
+#typedef int (*Py_tracefunc)(PyObject *, struct _frame *, int, PyObject *);
+Py_tracefunc = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.py_object, ctypes.py_object, ctypes.c_int, ctypes.py_object)
+
+class PyThreadState(ctypes.Structure):
+    _fields_ = [("next",                ctypes.POINTER(ctypes.c_int)),
+                ("interp",              ctypes.POINTER(ctypes.c_int)),
+                ('frame',               ctypes.POINTER(ctypes.c_int)),
+                ('recursion_depth',     ctypes.c_int),
+                ('tracing',             ctypes.c_int),
+                ('use_tracing',         ctypes.c_int),
+                ('c_profilefunc',       Py_tracefunc),
+                ('c_tracefunc',         Py_tracefunc),
+                ('c_profileobj',        ctypes.py_object),
+                ('c_traceobj',          ctypes.py_object),
+                ('curexc_type',         ctypes.py_object),
+                ('curexc_value',        ctypes.py_object),
+                ('curexc_traceback',    ctypes.py_object),
+                ('exc_type',            ctypes.py_object),
+                ('exc_value',           ctypes.py_object),
+                ('exc_traceback',       ctypes.py_object),
+                ('dict',                ctypes.py_object),
+                ('tick_counter',        ctypes.c_int),
+                ('gilstate_counter',    ctypes.c_int),
+                ('async_exc',           ctypes.py_object),
+                ('thread_id',           ctypes.c_long)
+                ]
 
 def handle_particular_user(conn,parent_thread,parent_thread_tid):
-    state = {'thread': parent_thread_tid, 'up': 0, 'line': None}
+    state = {'thread': parent_thread_tid, 'up': 0, 'line': None, 'breaks': []}
     poll = select.poll()
     poll.register(conn, select.POLLIN)
     request_pending = ''
-    while not only_thread():# parent_thread.isAlive():
+    while not only_thread():
+        set_max_ticks_remaining()
         ret = poll.poll(.3)
         for fd, event in ret:
             data = conn.recv(1024)
@@ -240,11 +315,10 @@ def cmd_server(parent_thread, parent_thread_tid):
             ret = poll.poll(.3)
             if len(ret) > 0:
                 conn, addr = s.accept()
-                with suspend_other_threads():
-                    try:
-                        handle_particular_user(conn,parent_thread,parent_thread_tid)
-                    except socket.error:
-                        pass
+                try:
+                    handle_particular_user(conn,parent_thread,parent_thread_tid)
+                except socket.error:
+                    pass
     finally:
         os.unlink(path)
 
@@ -319,6 +393,12 @@ class DebugShell(cmd.Cmd):
     def do_list(self, line):
         print self.client_handle_request('get_list',line),
 
+    def do_cont(self, line):
+        self.client_handle_request('continue_threads')
+
+    def do_rit(self, line):
+        self.client_handle_request('rit')
+
     def do_EOF(self, line):
         self.client_handle_request('exit')
         return True
@@ -329,6 +409,8 @@ if __name__ == '__main__':
     else:
         DebugShell(sys.argv[1]).cmdloop()
 else:
+    global __pydebug_breakpoint_hit
+    __pydebug_breakpoint_hit = False
     print 'main thread ident=',_thread.get_ident()
     global debug__has_loaded_thread
     try:
