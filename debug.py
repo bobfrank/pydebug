@@ -41,7 +41,8 @@ def bt(state):
 @command
 def allbt(state):
     reload(sys)
-    frames = [x for x in sys._current_frames().items() if x[0] != _thread.get_ident()]
+    global debug__has_loaded_thread
+    frames = [x for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
     result = ''
     for frame_i in frames:
         tid, frame = frame_i
@@ -58,7 +59,8 @@ def thbt(state, thread):
 
 @command
 def threads(state):
-    frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident()]
+    global debug__has_loaded_thread
+    frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
     return '\n'.join(frames)
 
 @command
@@ -67,7 +69,8 @@ def get_thread(state):
 
 @command
 def set_thread(state, thread):
-    frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident()]
+    global debug__has_loaded_thread
+    frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
     if thread not in frames:
         return 'Error: No such thread'
     else:
@@ -171,7 +174,8 @@ def get_list(state, line):
     return ''.join(['%5i %s'%(i+1,lines[i]) for i in xrange(min_line_no,max_line_no)])
 
 def only_thread():
-    other_threads = [x[1] for x in sys._current_frames().items() if x[0] != _thread.get_ident()]
+    global debug__has_loaded_thread
+    other_threads = [x[1] for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
     if len(other_threads) == 1:
         top = other_threads[0]
         back = top.f_back
@@ -199,6 +203,14 @@ def run_next_command(state):
     finally:
         state['breaks'] = saved_breaks
 
+def ignored_tracing_function(frame, event, arg):
+    return ignored_tracing_function
+def ignored_tracing_thread(lock):
+    global debug__has_loaded_thread
+    debug__has_loaded_thread = _thread.get_ident()
+    sys.settrace(ignored_tracing_function)
+    lock.acquire()
+
 def tracefunc(state, frame, what, arg):
     print >>sys.stdout, 'state=',state,'frame=',frame,'what=',what,'arg=',arg
     print (frame.f_code.co_filename,frame.f_lineno, frame.f_code.co_name)
@@ -206,12 +218,14 @@ def tracefunc(state, frame, what, arg):
     return 0
 
 def setup_thread_tracer(state, setting):
+    #_Py_TracingPossible = ctypes.cast(ctypes.pythonapi._Py_TracingPossible,ctypes.POINTER(ctypes.c_int))[0]
     interp = ctypes.pythonapi.PyInterpreterState_Head()
     t      = ctypes.pythonapi.PyInterpreterState_ThreadHead(interp)
     while t != 0:
         t_p = ctypes.cast(t,ctypes.POINTER(PyThreadState))[0]
-        if t_p.thread_id != _thread.get_ident():
+        if t_p.thread_id != _thread.get_ident() and t_p.thread_id != debug__has_loaded_thread:
             if setting:
+                #_Py_TracingPossible += 1
                 print 'setting tracefunc for',t_p
                 print t_p.use_tracing
                 print t_p.tracing
@@ -220,6 +234,7 @@ def setup_thread_tracer(state, setting):
                 t_p.use_tracing = 1
                 t_p.tracing     = 0
             else:
+                #_Py_TracingPossible -= 1
                 print 'clearing tracefunc for',t_p
                 t_p.use_tracing = 0
         t = ctypes.pythonapi.PyThreadState_Next(t)
@@ -238,7 +253,7 @@ def continue_threads(state):
             _Py_Ticker = 1000
         _Py_Ticker = 2**31-1
     finally:
-        setup_thread_tracer(state, False)
+        setup_thread_tracer(state, False) # if connection breaks, I should call this too
 
 #typedef int (*Py_tracefunc)(PyObject *, struct _frame *, int, PyObject *);
 Py_tracefunc = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.py_object, ctypes.py_object, ctypes.c_int, ctypes.py_object)
@@ -293,10 +308,13 @@ def handle_particular_user(conn,parent_thread,parent_thread_tid):
                     out_enc = '%s\n'%base64.b64encode(pickle.dumps(True))
                     conn.send(out_enc)
                     return
+                print 'got command',cmd,args,kwds
                 if cmd in runnable_commands:
+                    print 'going to run'
                     try:
                         output = runnable_commands[cmd](state, *args,**kwds)
                     except:
+                        traceback.print_exc()
                         output = traceback.format_exc()
             out_enc = '%s\n'%base64.b64encode(pickle.dumps(output))
             conn.send(out_enc)
@@ -305,6 +323,9 @@ def cmd_server(parent_thread, parent_thread_tid):
     mypid = os.getpid()
     path = '/tmp/py.debug.%s'%mypid
     try:
+        lock = threading.Lock()
+        igtt = threading.Thread(target=ignored_tracing_thread, args=(lock,))
+        igtt.start()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.bind(path)
         os.chmod(path, 0777)
@@ -320,6 +341,7 @@ def cmd_server(parent_thread, parent_thread_tid):
                 except socket.error:
                     pass
     finally:
+        lock.release()
         os.unlink(path)
 
 class DebugShell(cmd.Cmd):
@@ -395,9 +417,6 @@ class DebugShell(cmd.Cmd):
 
     def do_cont(self, line):
         self.client_handle_request('continue_threads')
-
-    def do_rit(self, line):
-        self.client_handle_request('rit')
 
     def do_EOF(self, line):
         self.client_handle_request('exit')

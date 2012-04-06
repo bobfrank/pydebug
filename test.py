@@ -4,7 +4,7 @@ import os
 import time
 def x(num):
     print 'num=',num
-    for i in xrange(100):
+    for i in xrange(1000):
         time.sleep(.1)
 if __name__ == '__main__':
     p = os.getpid()
