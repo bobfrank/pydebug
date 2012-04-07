@@ -30,7 +30,7 @@ Py_tracefunc = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.py_object, ctypes.py_object
 class PyThreadState(ctypes.Structure):
     _fields_ = [("next",                ctypes.POINTER(ctypes.c_int)),
                 ("interp",              ctypes.POINTER(ctypes.c_int)),
-                ('frame',               ctypes.POINTER(ctypes.c_int)),
+                ('frame',               ctypes.py_object),
                 ('recursion_depth',     ctypes.c_int),
                 ('tracing',             ctypes.c_int),
                 ('use_tracing',         ctypes.c_int),
@@ -70,8 +70,55 @@ class ServerHandler(object):
         self.line    = None
         self.thread  = parent_thread_tid
 
+    def __readlines(self, filename):
+        fd = libc.open(filename,os.O_RDONLY)
+        file_data = ''
+        try:
+            rcode = 1024
+            while rcode == 1024:
+                data  = ctypes.create_string_buffer(1024)
+                rcode = libc.read(fd, data, len(data))
+                file_data += data.value
+        finally:
+            libc.close(fd)
+        return file_data.split('\n') #TODO need to fix this to just extract the line(s) that are desired
+
+    def __get_line(self, filename, lineno):
+        return self.__readlines(filename)[lineno-1]
+
+    def __format_stack(self, f, limit = None):
+        ls = []
+        n = 0
+        while f is not None and (limit is None or n < limit):
+            lineno = f.f_lineno
+            co = f.f_code
+            filename = co.co_filename
+            name = co.co_name
+            #linecache.checkcache(filename)
+            line = self.__get_line(filename, lineno) #linecache.getline(filename, lineno, f.f_globals)
+            if line: line = line.strip()
+            else: line = None
+            ls.append((filename, lineno, name, line))
+            f = f.f_back
+            n = n+1
+        ls.reverse()
+        return traceback.format_list(ls)
+
+    def __current_frames(self):
+        out = {}
+        global debug__has_loaded_thread
+        ignored_thread = debug__has_loaded_thread
+        interp = ctypes.pythonapi.PyInterpreterState_Head()
+        t      = ctypes.pythonapi.PyInterpreterState_ThreadHead(interp)
+        while t != 0:
+            t_p = ctypes.cast(t,ctypes.POINTER(PyThreadState))[0]
+            if t_p.thread_id != _thread.get_ident() and t_p.thread_id != ignored_thread:
+                out[t_p.thread_id] = t_p.frame
+            t = ctypes.pythonapi.PyThreadState_Next(t)
+        return out
+
     def __get_frame(self):
-        frame = sys._current_frames()[self.thread]
+        frame = self.__current_frames()[self.thread]
         up = self.up-1
         while up >= 0 and frame is not None:
             frame = frame.f_back
@@ -80,37 +127,33 @@ class ServerHandler(object):
 
     def do0_bt(self):
         """backtrace"""
-        stacks = traceback.format_stack(sys._current_frames()[self.thread])
+        stacks = self.__format_stack(self.__current_frames()[self.thread])
         stacks = ['%s%s'%(['  ','**'][len(stacks)-1-self.up==i], x[2:]) for i,x in enumerate(stacks)]
         return '\n'.join(stacks)
 
     def do1_bt(self, thread='*'):
-        global debug__has_loaded_thread
-        frames = [x for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
+        frames = self.__current_frames().items()
         result = ''
         for frame_i in frames:
             tid, frame = frame_i
-            stacks = traceback.format_stack(frame)
+            stacks = self.__format_stack(frame)
             result += '-------- Thread %s\n%s\n'%(tid,'\n'.join(stacks))
         return result
 
     def do2_bt(self, thread):
-        stacks = traceback.format_stack(sys._current_frames()[int(thread)])
+        stacks = self.__format_stack(self.__current_frames()[int(thread)])
         stacks = [''.join(x) for i,x in enumerate(stacks)]
         return '\n'.join(stacks)
 
     def do_threads(self):
-        global debug__has_loaded_thread
-        frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
-        return '\n'.join(frames)
+        return '\n'.join( [str(x) for x in self.__current_frames().values()] )
 
     def do0_thr(self):
         """Set / Get Thread"""
         return self.thread
 
     def do1_thr(self, thread):
-        global debug__has_loaded_thread
-        frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
+        frames = [str(x) for x in self.__current_frames().values()]
         if thread not in frames:
             return 'Error: No such thread'
         else:
@@ -127,14 +170,14 @@ class ServerHandler(object):
             return 'Error: Nothing higher'
         else:
             self.line = None
-            return '\n'.join(traceback.format_stack(frame, 1))
+            return '\n'.join(self.__format_stack(frame, 1))
 
     def do_down(self):
         if self.up > 0:
             self.up -= 1
             frame = self.__get_frame()
             self.line = None
-            return '\n'.join(traceback.format_stack(frame, 1))
+            return '\n'.join(self.__format_stack(frame, 1))
         else:
             return 'Error: Nothing lower'
 
@@ -181,27 +224,14 @@ class ServerHandler(object):
 
     def __list(self):
         frame = self.__get_frame()
-        fd = libc.open(frame.f_code.co_filename,os.O_RDONLY)
-        libc.printf('fd=%d\n',fd)
-        file_data = ''
-        try:
-            rcode = 1024
-            while rcode == 1024:
-                data = ctypes.create_string_buffer(1024)
-                rcode = libc.read(fd, data, len(data))
-                #rcode = libc.fread(data, 1, len(data), fp)
-                libc.printf('len(data)=%d, rcode=%d\n', len(data), rcode)
-                file_data += data.value
-        finally:
-            libc.close(fd)
-        lines = file_data.split('\n') #TODO get the lines which are needed in the above file processing (just want to disable any GIL releases for now)
+        lines = self.__readlines(frame.f_code.co_filename)
         if self.line < 5:
             min_line_no = 0
             max_line_no = min(len(lines)-1,10)
         else:
             min_line_no = self.line-5
             max_line_no = min(len(lines)-1,self.line+5)
-        return ''.join(['%5i %s\n'%(i+1,lines[i]) for i in xrange(min_line_no,max_line_no)])
+        return ''.join(['%5i %s\n'%(i+1,lines[i]) for i in xrange(min_line_no,max_line_no)])[:-1]
     def do0_list(self, line='-'):
         self.line = max(self.line-10,0)
         return self.__list()
@@ -287,7 +317,6 @@ def handle_particular_user(conn,parent_thread,parent_thread_tid):
     _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))
     try:
         while not only_thread():
-            libc.printf('still locked\n')
             _Py_Ticker[0] = 2**31-1 # reset to max ticks remaining
             ret = libc.poll(ctypes.byref(poll), 1, 300)  # pointer to pollfd object, 1 pollfd object, 300 ms timeout
             if ret > 0:
@@ -298,7 +327,6 @@ def handle_particular_user(conn,parent_thread,parent_thread_tid):
                     libc.printf('ERROR -- %s\n', err_name)
                     return
                 if count == 0:
-                    libc.printf('done\n')
                     return
                 request_pending += data.value
             elif ret < 0:
@@ -308,20 +336,15 @@ def handle_particular_user(conn,parent_thread,parent_thread_tid):
             if request_pending.find('\n') >= 0:
                 request_is = request_pending.split('\n')
                 request_pending = '\n'.join(request_is[1:])
-                libc.printf('got reqeuest, converting to python object\n')
                 request = pickle.loads(base64.b64decode(request_is[0]))
-                libc.printf('request=%s\n', repr(request))
                 try:
-                    libc.printf('reload sys\n')
                     reload(sys)
-                    libc.printf('reloaded\n')
                     output = sh.mux(request['command'], *request['args'])
                 except:
                     output = traceback.format_exc()
                 out_enc = '%s\n'%base64.b64encode(pickle.dumps(output))
                 libc.send(conn.fileno(), ctypes.c_char_p(out_enc), len(out_enc))
                 if output == 'exit':
-                    libc.printf('exit\n')
                     return
     finally:
         ctypes.pythonapi.PyOS_setsig(signal.SIGINT, restored_sigint)
@@ -389,7 +412,8 @@ class DebugShell(cmd.Cmd):
 
     def default(self, line):
         items = line.strip().split(' ')
-        libc.printf(repr(self.client_handle_request(*items)))
+        libc.printf(self.client_handle_request(*items))
+        libc.printf('\n')
     def do_EOF(self, line):
         self.client_handle_request('exit')
         return True
