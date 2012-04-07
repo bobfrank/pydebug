@@ -80,13 +80,11 @@ class ServerHandler(object):
 
     def do0_bt(self):
         """backtrace"""
-        reload(sys)
         stacks = traceback.format_stack(sys._current_frames()[self.thread])
         stacks = ['%s%s'%(['  ','**'][len(stacks)-1-self.up==i], x[2:]) for i,x in enumerate(stacks)]
         return '\n'.join(stacks)
 
     def do1_bt(self, thread='*'):
-        reload(sys)
         global debug__has_loaded_thread
         frames = [x for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
         result = ''
@@ -97,7 +95,6 @@ class ServerHandler(object):
         return result
 
     def do2_bt(self, thread):
-        reload(sys)
         stacks = traceback.format_stack(sys._current_frames()[int(thread)])
         stacks = [''.join(x) for i,x in enumerate(stacks)]
         return '\n'.join(stacks)
@@ -184,14 +181,27 @@ class ServerHandler(object):
 
     def __list(self):
         frame = self.__get_frame()
-        lines = open(frame.f_code.co_filename).readlines()
+        fd = libc.open(frame.f_code.co_filename,os.O_RDONLY)
+        libc.printf('fd=%d\n',fd)
+        file_data = ''
+        try:
+            rcode = 1024
+            while rcode == 1024:
+                data = ctypes.create_string_buffer(1024)
+                rcode = libc.read(fd, data, len(data))
+                #rcode = libc.fread(data, 1, len(data), fp)
+                libc.printf('len(data)=%d, rcode=%d\n', len(data), rcode)
+                file_data += data.value
+        finally:
+            libc.close(fd)
+        lines = file_data.split('\n') #TODO get the lines which are needed in the above file processing (just want to disable any GIL releases for now)
         if self.line < 5:
             min_line_no = 0
             max_line_no = min(len(lines)-1,10)
         else:
             min_line_no = self.line-5
             max_line_no = min(len(lines)-1,self.line+5)
-        return ''.join(['%5i %s'%(i+1,lines[i]) for i in xrange(min_line_no,max_line_no)])
+        return ''.join(['%5i %s\n'%(i+1,lines[i]) for i in xrange(min_line_no,max_line_no)])
     def do0_list(self, line='-'):
         self.line = max(self.line-10,0)
         return self.__list()
@@ -226,8 +236,7 @@ class ServerHandler(object):
                                 return fn(*args_in)
 
 def tracefunc(state, frame, what, arg):
-    print >>sys.stdout, 'state=',state,'frame=',frame,'what=',what,'arg=',arg
-    print (frame.f_code.co_filename,frame.f_lineno, frame.f_code.co_name)
+    # details = (frame.f_code.co_filename,frame.f_lineno, frame.f_code.co_name)
     sys.stdout.flush()
     return 0
 
@@ -238,15 +247,11 @@ def setup_thread_tracer(state, setting):
         t_p = ctypes.cast(t,ctypes.POINTER(PyThreadState))[0]
         if t_p.thread_id != _thread.get_ident() and t_p.thread_id != debug__has_loaded_thread:
             if setting:
-                print 'setting tracefunc for',t_p
-                print t_p.use_tracing
-                print t_p.tracing
                 t_p.c_tracefunc = Py_tracefunc(tracefunc)
                 t_p.c_traceobj  = state
                 t_p.use_tracing = 1
                 t_p.tracing     = 0
             else:
-                print 'clearing tracefunc for',t_p
                 t_p.use_tracing = 0
         t = ctypes.pythonapi.PyThreadState_Next(t)
 
@@ -282,49 +287,41 @@ def handle_particular_user(conn,parent_thread,parent_thread_tid):
     _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))
     try:
         while not only_thread():
-            print 'not only thread'
-            print '--',_Py_Ticker[0]
-            _Py_Ticker[0] = 2**31-1
-            print 'max ticks set'
-            ret = libc.poll(ctypes.byref(poll), 1, 300)
-            print 'ret=',ret
-            #ret = poll.poll(.3) # TODO am I releasing the GIL here? (do I need to set static PyThread_type_lock pending_lock = to 0?)
+            libc.printf('still locked\n')
+            _Py_Ticker[0] = 2**31-1 # reset to max ticks remaining
+            ret = libc.poll(ctypes.byref(poll), 1, 300)  # pointer to pollfd object, 1 pollfd object, 300 ms timeout
             if ret > 0:
-                print 'recving'
                 data = ctypes.create_string_buffer(1024)
-                count = libc.recv(conn.fileno(), data, 1024, 0)
+                count = libc.recv(conn.fileno(), data, len(data), 0)
                 if count < 0:
-                    err = libc.__errno_location()[0]
-                    print '[r]error',err
-                    print '[r]----',errno.errorcode[err]
+                    err_name = errno.errorcode[ libc.__errno_location()[0] ]
+                    libc.printf('ERROR -- %s\n', err_name)
                     return
-                print 'count=',count
-                #data = conn.recv(1024) # and here?
-                print 'recvd',data.value
                 if count == 0:
-                    print 'done'
+                    libc.printf('done\n')
                     return
                 request_pending += data.value
             elif ret < 0:
-                err = libc.__errno_location()[0]
-                print 'error',err
-                print '----',errno.errorcode[err]
+                err_name = errno.errorcode[ libc.__errno_location()[0] ]
+                libc.printf('ERROR -- %s\n', err_name)
                 return
             if request_pending.find('\n') >= 0:
                 request_is = request_pending.split('\n')
                 request_pending = '\n'.join(request_is[1:])
+                libc.printf('got reqeuest, converting to python object\n')
                 request = pickle.loads(base64.b64decode(request_is[0]))
+                libc.printf('request=%s\n', repr(request))
                 try:
+                    libc.printf('reload sys\n')
+                    reload(sys)
+                    libc.printf('reloaded\n')
                     output = sh.mux(request['command'], *request['args'])
                 except:
                     output = traceback.format_exc()
                 out_enc = '%s\n'%base64.b64encode(pickle.dumps(output))
-                print 'sending'
                 libc.send(conn.fileno(), ctypes.c_char_p(out_enc), len(out_enc))
-                #conn.send(out_enc)
-                print 'sent'
                 if output == 'exit':
-                    print 'exit'
+                    libc.printf('exit\n')
                     return
     finally:
         ctypes.pythonapi.PyOS_setsig(signal.SIGINT, restored_sigint)
@@ -359,7 +356,7 @@ def cmd_server(parent_thread, parent_thread_tid):
                 try:
                     handle_particular_user(conn,parent_thread,parent_thread_tid)
                 except:
-                    print traceback.format_exc()
+                    libc.printf(traceback.format_exc())
     finally:
         lock.release()
         os.unlink(path)
@@ -373,7 +370,7 @@ class DebugShell(cmd.Cmd):
         self.conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.conn.connect('/tmp/py.debug.%s'%self.pid)
         self.poll = select.poll()
-        self.poll.register(self.conn, select.POLLIN)
+        self.poll.register(self.conn, select.POLLIN|select.POLLHUP)
         cmd.Cmd.__init__(self)
 
     def client_handle_request(self, command, *args):
@@ -392,7 +389,7 @@ class DebugShell(cmd.Cmd):
 
     def default(self, line):
         items = line.strip().split(' ')
-        print self.client_handle_request(*items)
+        libc.printf(repr(self.client_handle_request(*items)))
     def do_EOF(self, line):
         self.client_handle_request('exit')
         return True
