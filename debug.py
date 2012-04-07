@@ -11,13 +11,18 @@ import uuid
 import socket
 import base64
 import select
-import ctypes 
+import signal
+import ctypes
+import errno
 import contextlib
 import inspect
 try:
     import _thread
 except ImportError:
     import thread as _thread
+
+libc = ctypes.PyDLL('libc.so.6') #need to use PyDLL since CDLL() releases the GIL
+libc.__errno_location.restype = ctypes.POINTER(ctypes.c_int)
 
 #typedef int (*Py_tracefunc)(PyObject *, struct _frame *, int, PyObject *);
 Py_tracefunc = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.py_object, ctypes.py_object, ctypes.c_int, ctypes.py_object)
@@ -199,7 +204,9 @@ class ServerHandler(object):
         return self.__line()
 
     def mux(self, command, *args_in):
-        if hasattr(self, 'do_%s'%command):
+        if command == 'exit':
+            return 'exit'
+        elif hasattr(self, 'do_%s'%command):
             return getattr(self, 'do_%s'%command)(*args_in)
         else:
             items = sorted(dir(self))
@@ -247,46 +254,81 @@ global __pydebug_breakpoint_hit
 
 def continue_threads(state):
     global __pydebug_breakpoint_hit
-    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))[0]
+    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))
     __pydebug_breakpoint_hit = False
     try:
         setup_thread_tracer(state, True)
         while not __pydebug_breakpoint_hit and not only_thread():
-            _Py_Ticker = 0    #switch to another thread
-            _Py_Ticker = 1000
-        _Py_Ticker = 2**31-1
+            _Py_Ticker[0] = 0    #switch to another thread
+            _Py_Ticker[0] = 100
+        _Py_Ticker[0] = 2**31-1
     finally:
         setup_thread_tracer(state, False) # if connection breaks, I should call this too
 
-def set_max_ticks_remaining():
-    # sys.setcheckinterval() doesn't cut it -- read ceval.c to see details
-    # I only noticed this being reset in Py_AddPendingCall and after it decrements down to 0
-    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))[0]
-    _Py_Ticker = 2**31-1
+class pollfd(ctypes.Structure):
+    _fields_ = [("fd",          ctypes.c_int),
+                ("events",      ctypes.c_short),
+                ('revents',     ctypes.c_short)
+                ]
 
 def handle_particular_user(conn,parent_thread,parent_thread_tid):
     sh = ServerHandler(parent_thread_tid)
-    poll = select.poll()
-    poll.register(conn, select.POLLIN)
+    poll = pollfd()
+    poll.fd      = conn.fileno()
+    poll.events  = select.POLLIN
+    poll.revents = select.POLLIN
     request_pending = ''
-    while not only_thread():
-        set_max_ticks_remaining()
-        ret = poll.poll(.3) # TODO am I releasing the GIL here?
-        for fd, event in ret:
-            data = conn.recv(1024) # and here?
-            if not data:
+    restored_sigint = ctypes.pythonapi.PyOS_setsig(signal.SIGINT, 1) # 1 == SIG_IGN
+    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))
+    try:
+        while not only_thread():
+            print 'not only thread'
+            print '--',_Py_Ticker[0]
+            _Py_Ticker[0] = 2**31-1
+            print 'max ticks set'
+            ret = libc.poll(ctypes.byref(poll), 1, 300)
+            print 'ret=',ret
+            #ret = poll.poll(.3) # TODO am I releasing the GIL here? (do I need to set static PyThread_type_lock pending_lock = to 0?)
+            if ret > 0:
+                print 'recving'
+                data = ctypes.create_string_buffer(1024)
+                count = libc.recv(conn.fileno(), data, 1024, 0)
+                if count < 0:
+                    err = libc.__errno_location()[0]
+                    print '[r]error',err
+                    print '[r]----',errno.errorcode[err]
+                    return
+                print 'count=',count
+                #data = conn.recv(1024) # and here?
+                print 'recvd',data.value
+                if count == 0:
+                    print 'done'
+                    return
+                request_pending += data.value
+            elif ret < 0:
+                err = libc.__errno_location()[0]
+                print 'error',err
+                print '----',errno.errorcode[err]
                 return
-            request_pending += data
-        if request_pending.find('\n') >= 0:
-            request_is = request_pending.split('\n')
-            request_pending = '\n'.join(request_is[1:])
-            request = pickle.loads(base64.b64decode(request_is[0]))
-            try:
-                output = sh.mux(request['command'], *request['args'])
-            except:
-                output = traceback.format_exc()
-            out_enc = '%s\n'%base64.b64encode(pickle.dumps(output))
-            conn.send(out_enc)
+            if request_pending.find('\n') >= 0:
+                request_is = request_pending.split('\n')
+                request_pending = '\n'.join(request_is[1:])
+                request = pickle.loads(base64.b64decode(request_is[0]))
+                try:
+                    output = sh.mux(request['command'], *request['args'])
+                except:
+                    output = traceback.format_exc()
+                out_enc = '%s\n'%base64.b64encode(pickle.dumps(output))
+                print 'sending'
+                libc.send(conn.fileno(), ctypes.c_char_p(out_enc), len(out_enc))
+                #conn.send(out_enc)
+                print 'sent'
+                if output == 'exit':
+                    print 'exit'
+                    return
+    finally:
+        ctypes.pythonapi.PyOS_setsig(signal.SIGINT, restored_sigint)
+        _Py_Ticker[0] = 0 #yield to other threads
 
 # the only purpose this thread serves is to make sure that (static global int) _Py_TracingPossible in ceval.c is set to >= 1
 def ignored_tracing_function(frame, event, arg):
@@ -316,8 +358,8 @@ def cmd_server(parent_thread, parent_thread_tid):
                 conn, addr = s.accept()
                 try:
                     handle_particular_user(conn,parent_thread,parent_thread_tid)
-                except socket.error:
-                    pass
+                except:
+                    print traceback.format_exc()
     finally:
         lock.release()
         os.unlink(path)
