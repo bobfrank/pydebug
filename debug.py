@@ -19,242 +19,6 @@ try:
 except ImportError:
     import thread as _thread
 
-runnable_commands = {}
-def command(fn):
-    runnable_commands[fn.__name__] = fn
-
-def get_frame(state):
-    frame = sys._current_frames()[state['thread']]
-    up = state['up']-1
-    while up >= 0 and frame is not None:
-        frame = frame.f_back
-        up -= 1
-    return frame
-
-@command
-def bt(state):
-    reload(sys)
-    stacks = traceback.format_stack(sys._current_frames()[state['thread']])
-    stacks = ['%s%s'%(['  ','**'][len(stacks)-1-state['up']==i], x[2:]) for i,x in enumerate(stacks)]
-    return '\n'.join(stacks)
-
-@command
-def allbt(state):
-    reload(sys)
-    global debug__has_loaded_thread
-    frames = [x for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
-    result = ''
-    for frame_i in frames:
-        tid, frame = frame_i
-        stacks = traceback.format_stack(frame)
-        result += '-------- Thread %s\n%s\n'%(tid,'\n'.join(stacks))
-    return result
-
-@command
-def thbt(state, thread):
-    reload(sys)
-    stacks = traceback.format_stack(sys._current_frames()[thread])
-    stacks = [repr(x) for i,x in enumerate(stacks)]
-    return '\n'.join(stacks)
-
-@command
-def threads(state):
-    global debug__has_loaded_thread
-    frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
-    return '\n'.join(frames)
-
-@command
-def get_thread(state):
-    return state['thread']
-
-@command
-def set_thread(state, thread):
-    global debug__has_loaded_thread
-    frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
-    if thread not in frames:
-        return 'Error: No such thread'
-    else:
-        state['up'] = 0
-        state['line'] = None
-        state['thread'] = int(thread)
-        return 'Switched to thread %s'%thread
-
-@command
-def up(state):
-    state['up'] += 1
-    frame = get_frame(state)
-    if frame is None:
-        state['up'] -= 1
-        return 'Error: Nothing higher'
-    else:
-        state['line'] = None
-        return '\n'.join(traceback.format_stack(frame, 1))
-
-@command
-def down(state):
-    if state['up'] > 0:
-        state['up'] -= 1
-        frame = get_frame(state)
-        state['line'] = None
-        return '\n'.join(traceback.format_stack(frame, 1))
-    else:
-        return 'Error: Nothing lower'
- 
-def _async_raise(tid, exctype):
-    """raises the exception, performs cleanup if needed"""
-    if not inspect.isclass(exctype):
-        raise TypeError("Only types can be raised (not instances)")
-    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), ctypes.py_object(exctype))
-    if res == 0:
-        raise ValueError("invalid thread id")
-    elif res != 1:
-        # """if it returns a number greater than one, you're in trouble, 
-        # and you should call it again with exc=NULL to revert the effect"""
-        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(tid), None)
-        raise SystemError("PyThreadState_SetAsyncExc failed")
-
-def get_variable(state, variable):
-    frame = get_frame(state)
-    var_names = variable.split('.')
-    if var_names[0] in frame.f_locals:
-        res = frame.f_locals[var_names[0]]
-    elif var_names[0] in frame.f_globals:
-        res = frame.f_globals[var_names[0]]
-    elif var_names[0] in dir(frame.f_globals['__builtins__']):
-        res = getattr(frame.f_globals['__builtins__'],var_names[0])
-    else:
-        raise RuntimeError('Error: couldnt find variable "%s" in scope'%variable)
-    for name in var_names[1:]:
-        res = getattr(res, name)
-    return res
-
-@command
-def throw(state, variable):
-    _async_raise(state['thread'], get_variable(state, variable))
-    return 'Asynchronously raising an exception of type %s'%variable
-
-@command
-def printv(state, variable):
-    return repr(get_variable(state,variable))
-
-@command
-def get_dir(state, variable):
-    return repr(dir(get_variable(state,variable)))
-
-@command
-def get_locals(state):
-    frame = get_frame(state)
-    return '\n'.join(frame.f_locals.keys())
-
-@command
-def get_globals(state):
-    frame = get_frame(state)
-    return '\n'.join(frame.f_globals.keys())
-
-@command
-def get_list(state, line):
-    frame = get_frame(state)
-    lines = open(frame.f_code.co_filename).readlines()
-
-    if line == '-' and state['line'] is not None:
-        state['line'] = max(state['line']-10, 0)
-    elif line != '':
-        state['line'] = int(line)
-    elif state['line'] is None:
-    	state['line'] = frame.f_lineno
-    else:
-        state['line'] = min(state['line']+10, len(lines)-6)
-
-    if state['line'] < 5:
-        min_line_no = 0
-        max_line_no = min(len(lines)-1,10)
-    else:
-        min_line_no = state['line']-5
-        max_line_no = min(len(lines)-1,state['line']+5)
-    return ''.join(['%5i %s'%(i+1,lines[i]) for i in xrange(min_line_no,max_line_no)])
-
-def only_thread():
-    global debug__has_loaded_thread
-    other_threads = [x[1] for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
-    if len(other_threads) == 1:
-        top = other_threads[0]
-        back = top.f_back
-        while back:
-            top  = back
-            back = top.f_back
-        return (top.f_code.co_name == '_exitfunc')
-    else:
-        return (len(other_threads) == 0)
-
-def set_max_ticks_remaining():
-    # sys.setcheckinterval() doesn't cut it -- read ceval.c to see details
-    # I only noticed this being reset in Py_AddPendingCall and after it decrements down to 0
-    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))[0]
-    _Py_Ticker = 2**31-1
-
-def run_next_command(state):
-    # note that we run to the next command only for the selected thread, others have to run just some number of ticks
-    state['up'] = 0
-    frame = get_frame(state)
-    saved_breaks = state['breaks']
-    try:
-        state['breaks'] = [(frame.f_code.co_filename,frame.f_lineno)]
-        continue_threads(state)
-    finally:
-        state['breaks'] = saved_breaks
-
-def ignored_tracing_function(frame, event, arg):
-    return ignored_tracing_function
-def ignored_tracing_thread(lock):
-    global debug__has_loaded_thread
-    debug__has_loaded_thread = _thread.get_ident()
-    sys.settrace(ignored_tracing_function)
-    lock.acquire()
-
-def tracefunc(state, frame, what, arg):
-    print >>sys.stdout, 'state=',state,'frame=',frame,'what=',what,'arg=',arg
-    print (frame.f_code.co_filename,frame.f_lineno, frame.f_code.co_name)
-    sys.stdout.flush()
-    return 0
-
-def setup_thread_tracer(state, setting):
-    #_Py_TracingPossible = ctypes.cast(ctypes.pythonapi._Py_TracingPossible,ctypes.POINTER(ctypes.c_int))[0]
-    interp = ctypes.pythonapi.PyInterpreterState_Head()
-    t      = ctypes.pythonapi.PyInterpreterState_ThreadHead(interp)
-    while t != 0:
-        t_p = ctypes.cast(t,ctypes.POINTER(PyThreadState))[0]
-        if t_p.thread_id != _thread.get_ident() and t_p.thread_id != debug__has_loaded_thread:
-            if setting:
-                #_Py_TracingPossible += 1
-                print 'setting tracefunc for',t_p
-                print t_p.use_tracing
-                print t_p.tracing
-                t_p.c_tracefunc = Py_tracefunc(tracefunc)
-                t_p.c_traceobj  = state
-                t_p.use_tracing = 1
-                t_p.tracing     = 0
-            else:
-                #_Py_TracingPossible -= 1
-                print 'clearing tracefunc for',t_p
-                t_p.use_tracing = 0
-        t = ctypes.pythonapi.PyThreadState_Next(t)
-
-global __pydebug_breakpoint_hit
-
-@command
-def continue_threads(state):
-    global __pydebug_breakpoint_hit
-    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))[0]
-    __pydebug_breakpoint_hit = False
-    try:
-        setup_thread_tracer(state, True)
-        while not __pydebug_breakpoint_hit and not only_thread():
-            _Py_Ticker = 0    #switch to another thread
-            _Py_Ticker = 1000
-        _Py_Ticker = 2**31-1
-    finally:
-        setup_thread_tracer(state, False) # if connection breaks, I should call this too
-
 #typedef int (*Py_tracefunc)(PyObject *, struct _frame *, int, PyObject *);
 Py_tracefunc = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.py_object, ctypes.py_object, ctypes.c_int, ctypes.py_object)
 
@@ -282,16 +46,234 @@ class PyThreadState(ctypes.Structure):
                 ('thread_id',           ctypes.c_long)
                 ]
 
+def only_thread():
+    global debug__has_loaded_thread
+    other_threads = [x[1] for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
+    if len(other_threads) == 1:
+        top = other_threads[0]
+        back = top.f_back
+        while back:
+            top  = back
+            back = top.f_back
+        return (top.f_code.co_name == '_exitfunc')
+    else:
+        return (len(other_threads) == 0)
+
+class ServerHandler(object):
+    def __init__(self, parent_thread_tid):
+        self.up      = 0
+        self.line    = None
+        self.thread  = parent_thread_tid
+
+    def __get_frame(self):
+        frame = sys._current_frames()[self.thread]
+        up = self.up-1
+        while up >= 0 and frame is not None:
+            frame = frame.f_back
+            up -= 1
+        return frame
+
+    def do0_bt(self):
+        """backtrace"""
+        reload(sys)
+        stacks = traceback.format_stack(sys._current_frames()[self.thread])
+        stacks = ['%s%s'%(['  ','**'][len(stacks)-1-self.up==i], x[2:]) for i,x in enumerate(stacks)]
+        return '\n'.join(stacks)
+
+    def do1_bt(self, thread='*'):
+        reload(sys)
+        global debug__has_loaded_thread
+        frames = [x for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
+        result = ''
+        for frame_i in frames:
+            tid, frame = frame_i
+            stacks = traceback.format_stack(frame)
+            result += '-------- Thread %s\n%s\n'%(tid,'\n'.join(stacks))
+        return result
+
+    def do2_bt(self, thread):
+        reload(sys)
+        stacks = traceback.format_stack(sys._current_frames()[int(thread)])
+        stacks = [''.join(x) for i,x in enumerate(stacks)]
+        return '\n'.join(stacks)
+
+    def do_threads(self):
+        global debug__has_loaded_thread
+        frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
+        return '\n'.join(frames)
+
+    def do0_thr(self):
+        """Set / Get Thread"""
+        return self.thread
+
+    def do1_thr(self, thread):
+        global debug__has_loaded_thread
+        frames = [str(x[0]) for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread]
+        if thread not in frames:
+            return 'Error: No such thread'
+        else:
+            self.up     = 0
+            self.line   = None
+            self.thread = int(thread)
+            return 'Switched to thread %s'%thread
+
+    def do_up(self):
+        self.up += 1
+        frame = self.__get_frame()
+        if frame is None:
+            self.up -= 1
+            return 'Error: Nothing higher'
+        else:
+            self.line = None
+            return '\n'.join(traceback.format_stack(frame, 1))
+
+    def do_down(self):
+        if self.up > 0:
+            self.up -= 1
+            frame = self.__get_frame()
+            self.line = None
+            return '\n'.join(traceback.format_stack(frame, 1))
+        else:
+            return 'Error: Nothing lower'
+
+    def __get_variable(self, variable):
+        frame = self.__get_frame()
+        var_names = variable.split('.')
+        if var_names[0] in frame.f_locals:
+            res = frame.f_locals[var_names[0]]
+        elif var_names[0] in frame.f_globals:
+            res = frame.f_globals[var_names[0]]
+        elif var_names[0] in dir(frame.f_globals['__builtins__']):
+            res = getattr(frame.f_globals['__builtins__'],var_names[0])
+        else:
+            raise RuntimeError('Error: couldnt find variable "%s" in scope'%variable)
+        for name in var_names[1:]:
+            res = getattr(res, name)
+        return res
+
+    def do_raise(self, exctype):
+        exctype_cls = self.__get_variable(exctype)
+        if not inspect.isclass(exctype_cls):
+            raise TypeError("Only types can be raised (not instances)")
+        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(self.thread), ctypes.py_object(exctype_cls))
+        if res == 0:
+            raise ValueError("invalid thread id")
+        elif res != 1:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(self.thread), None)
+            raise SystemError("PyThreadState_SetAsyncExc failed")
+        return 'Asynchronously raising an exception of type %s'%exctype
+
+    def do_p(self, variable):
+        return repr(self.__get_variable(variable))
+
+    def do_dir(self, variable):
+        return repr(dir(self.__get_variable(variable)))
+
+    def do_locals(self):
+        frame = self.__get_frame()
+        return '\n'.join(frame.f_locals.keys())
+
+    def do_globals(self):
+        frame = self.__get_frame()
+        return '\n'.join(frame.f_globals.keys())
+
+    def __list(self):
+        frame = self.__get_frame()
+        lines = open(frame.f_code.co_filename).readlines()
+        if self.line < 5:
+            min_line_no = 0
+            max_line_no = min(len(lines)-1,10)
+        else:
+            min_line_no = self.line-5
+            max_line_no = min(len(lines)-1,self.line+5)
+        return ''.join(['%5i %s'%(i+1,lines[i]) for i in xrange(min_line_no,max_line_no)])
+    def do0_list(self, line='-'):
+        self.line = max(self.line-10,0)
+        return self.__list()
+    def do1_list(self):
+        frame = self.__get_frame()
+        self.line = frame.f_lineno
+        return self.__list()
+    def do2_list(self, line):
+        self.line = int(line)
+        return self.__line()
+
+    def mux(self, command, *args_in):
+        if hasattr(self, 'do_%s'%command):
+            return getattr(self, 'do_%s'%command)(*args_in)
+        else:
+            items = sorted(dir(self))
+            for item in items:
+                if item.startswith('do') and item[-len(command)-1:] == '_%s'%command:
+                    fn = getattr(self, item)
+                    args, varargs, keywords, defaults = inspect.getargspec(fn)
+                    if len(args)-1 == len(args_in): # -1 for self
+                        if defaults is None:
+                            return fn(*args_in)
+                        else:
+                            good = True
+                            for i,default in enumerate(reversed(defaults)):
+                                if args_in[-i-1] != default:
+                                    good = False
+                            if good:
+                                return fn(*args_in)
+
+def tracefunc(state, frame, what, arg):
+    print >>sys.stdout, 'state=',state,'frame=',frame,'what=',what,'arg=',arg
+    print (frame.f_code.co_filename,frame.f_lineno, frame.f_code.co_name)
+    sys.stdout.flush()
+    return 0
+
+def setup_thread_tracer(state, setting):
+    interp = ctypes.pythonapi.PyInterpreterState_Head()
+    t      = ctypes.pythonapi.PyInterpreterState_ThreadHead(interp)
+    while t != 0:
+        t_p = ctypes.cast(t,ctypes.POINTER(PyThreadState))[0]
+        if t_p.thread_id != _thread.get_ident() and t_p.thread_id != debug__has_loaded_thread:
+            if setting:
+                print 'setting tracefunc for',t_p
+                print t_p.use_tracing
+                print t_p.tracing
+                t_p.c_tracefunc = Py_tracefunc(tracefunc)
+                t_p.c_traceobj  = state
+                t_p.use_tracing = 1
+                t_p.tracing     = 0
+            else:
+                print 'clearing tracefunc for',t_p
+                t_p.use_tracing = 0
+        t = ctypes.pythonapi.PyThreadState_Next(t)
+
+global __pydebug_breakpoint_hit
+
+def continue_threads(state):
+    global __pydebug_breakpoint_hit
+    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))[0]
+    __pydebug_breakpoint_hit = False
+    try:
+        setup_thread_tracer(state, True)
+        while not __pydebug_breakpoint_hit and not only_thread():
+            _Py_Ticker = 0    #switch to another thread
+            _Py_Ticker = 1000
+        _Py_Ticker = 2**31-1
+    finally:
+        setup_thread_tracer(state, False) # if connection breaks, I should call this too
+
+def set_max_ticks_remaining():
+    # sys.setcheckinterval() doesn't cut it -- read ceval.c to see details
+    # I only noticed this being reset in Py_AddPendingCall and after it decrements down to 0
+    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))[0]
+    _Py_Ticker = 2**31-1
+
 def handle_particular_user(conn,parent_thread,parent_thread_tid):
-    state = {'thread': parent_thread_tid, 'up': 0, 'line': None, 'breaks': []}
+    sh = ServerHandler(parent_thread_tid)
     poll = select.poll()
     poll.register(conn, select.POLLIN)
     request_pending = ''
     while not only_thread():
         set_max_ticks_remaining()
-        ret = poll.poll(.3)
+        ret = poll.poll(.3) # TODO am I releasing the GIL here?
         for fd, event in ret:
-            data = conn.recv(1024)
+            data = conn.recv(1024) # and here?
             if not data:
                 return
             request_pending += data
@@ -299,25 +281,21 @@ def handle_particular_user(conn,parent_thread,parent_thread_tid):
             request_is = request_pending.split('\n')
             request_pending = '\n'.join(request_is[1:])
             request = pickle.loads(base64.b64decode(request_is[0]))
-            output = None
-            if 'command' in request and 'args' in request and 'kwds' in request:
-                cmd  = request['command']
-                args = request['args']
-                kwds = request['kwds']
-                if cmd == 'exit':
-                    out_enc = '%s\n'%base64.b64encode(pickle.dumps(True))
-                    conn.send(out_enc)
-                    return
-                print 'got command',cmd,args,kwds
-                if cmd in runnable_commands:
-                    print 'going to run'
-                    try:
-                        output = runnable_commands[cmd](state, *args,**kwds)
-                    except:
-                        traceback.print_exc()
-                        output = traceback.format_exc()
+            try:
+                output = sh.mux(request['command'], *request['args'])
+            except:
+                output = traceback.format_exc()
             out_enc = '%s\n'%base64.b64encode(pickle.dumps(output))
             conn.send(out_enc)
+
+# the only purpose this thread serves is to make sure that (static global int) _Py_TracingPossible in ceval.c is set to >= 1
+def ignored_tracing_function(frame, event, arg):
+    return ignored_tracing_function
+def ignored_tracing_thread(lock):
+    global debug__has_loaded_thread
+    debug__has_loaded_thread = _thread.get_ident()
+    sys.settrace(ignored_tracing_function)
+    lock.acquire()
 
 def cmd_server(parent_thread, parent_thread_tid):
     mypid = os.getpid()
@@ -346,7 +324,6 @@ def cmd_server(parent_thread, parent_thread_tid):
 
 class DebugShell(cmd.Cmd):
     """Command line for debugging attached pid process"""
-
     prompt = '(py.debug) '
 
     def __init__(self, pid):
@@ -357,8 +334,8 @@ class DebugShell(cmd.Cmd):
         self.poll.register(self.conn, select.POLLIN)
         cmd.Cmd.__init__(self)
 
-    def client_handle_request(self, command, *args, **kwds):
-        request = {'command': command, 'args': args, 'kwds': kwds}
+    def client_handle_request(self, command, *args):
+        request = {'command': command, 'args': args}
         req_enc = '%s\n'%base64.b64encode(pickle.dumps(request))
         self.conn.send(req_enc)
         request_pending = ''
@@ -371,53 +348,9 @@ class DebugShell(cmd.Cmd):
                 request_pending += data
         return pickle.loads(base64.b64decode(request_pending.split('\n')[0]))
 
-    def do_bt(self,line):
-        if line.strip() == '':
-            print self.client_handle_request('bt')
-        elif line.strip() == '*':
-            print self.client_handle_request('allbt')
-        else:
-            print self.client_handle_request('thbt',int(line))
-
-    def do_threads(self, line):
-        print self.client_handle_request('threads')
-
-    def do_thr(self, line):
-        if line.strip() == '':
-            print self.client_handle_request('get_thread')
-        else:
-            print self.client_handle_request('set_thread',line.strip())
-
-    def do_up(self, line):
-        print self.client_handle_request('up')
-
-    def do_down(self, line):
-        print self.client_handle_request('down')
-
-    def do_raise(self, line):
-        print self.client_handle_request('throw', line)
-
-    def do_p(self, name):
-        print self.client_handle_request('printv',name)
-
-    def do_print(self, name):
-        print self.client_handle_request('printv',name)
-
-    def do_dir(self, name):
-        print self.client_handle_request('get_dir',name)
-
-    def do_locals(self, line):
-        print self.client_handle_request('get_locals')
-
-    def do_globals(self, line):
-        print self.client_handle_request('get_globals')
-
-    def do_list(self, line):
-        print self.client_handle_request('get_list',line),
-
-    def do_cont(self, line):
-        self.client_handle_request('continue_threads')
-
+    def default(self, line):
+        items = line.strip().split(' ')
+        print self.client_handle_request(*items)
     def do_EOF(self, line):
         self.client_handle_request('exit')
         return True
@@ -430,7 +363,6 @@ if __name__ == '__main__':
 else:
     global __pydebug_breakpoint_hit
     __pydebug_breakpoint_hit = False
-    print 'main thread ident=',_thread.get_ident()
     global debug__has_loaded_thread
     try:
         x = debug__has_loaded_thread
@@ -438,4 +370,3 @@ else:
         debug__has_loaded_thread = True
         t = threading.Thread(target=cmd_server, args=(threading.currentThread(),_thread.get_ident()))
         t.start()
-
