@@ -285,12 +285,13 @@ class ServerHandler(object):
         return self.__line()
 
     def __setup_thread_tracer(self, setting):
+        empty_obj = ctypes.py_object()
         if setting:
             func = Py_tracefunc(breakpoint_tracer)
             arg = self
         else:
             func = ctypes.cast(None, Py_tracefunc)
-            arg = ctypes.py_object()
+            arg = empty_obj
         global debug__has_loaded_thread
         interp = ctypes.pythonapi.PyInterpreterState_Head()
         t      = ctypes.pythonapi.PyInterpreterState_ThreadHead(interp)
@@ -301,12 +302,12 @@ class ServerHandler(object):
                     temp = t_p[0].c_traceobj
                 except ValueError:
                     temp = None
-                if arg is not None: #Py_XINCREF
+                if arg != empty_obj: #Py_XINCREF
                     #ctypes.pythonapi._Total
                     refcount = ctypes.c_long.from_address(id(arg))
                     refcount.value += 1
                 t_p[0].c_tracefunc = ctypes.cast(None, Py_tracefunc)
-                t_p[0].c_traceobj = ctypes.py_object()
+                t_p[0].c_traceobj  = empty_obj
                 t_p[0].use_tracing = int(t_p[0].c_profilefunc is not None)
                 if temp is not None: #Py_XDECREF
                     refcount = ctypes.c_long.from_address(id(temp))
