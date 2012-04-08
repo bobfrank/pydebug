@@ -5,8 +5,8 @@ import time
 def x(num):
     print 'num=',num
     for i in xrange(1000):
-        print 'i',i,'(',num,')'
         time.sleep(.1)
+        print 'i',i,'(',num,')'
 if __name__ == '__main__':
     p = os.getpid()
     t = threading.Thread(target=x,args=(0,))

@@ -16,6 +16,7 @@ import ctypes
 import errno
 import contextlib
 import inspect
+import dis
 try:
     import _thread
 except ImportError:
@@ -64,11 +65,44 @@ def only_thread():
     else:
         return (len(other_threads) == 0)
 
+class DictObj(object):
+    def __init__(self, **kwds): 
+        self.__dict__.update(kwds)
+
+def breakpoint_tracer(self, frame, what, arg):
+    if not isinstance(self, ServerHandler):
+        return 0
+    lineno   = frame.f_lineno
+    co       = frame.f_code
+    filename = co.co_filename
+    name     = co.co_name
+    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))
+    if self.breakpoint_hit:
+        _Py_Ticker[0] = 0
+    else:
+        f2 = DictObj(f_code=DictObj(co_filename=filename,co_name=name), f_back=None, f_lineno=lineno)
+        if name in self.function_breaks:
+            self.breakpoint_hit = f2
+            _Py_Ticker[0] = 0
+        elif (filename, lineno) in self.line_breaks:
+            self.breakpoint_hit = f2
+            _Py_Ticker[0] = 0
+        elif self.break_line_change is not None and (filename, lineno) != self.break_line_change:
+            # TODO probably also compare the thread number
+            self.breakpoint_hit = f2
+            _Py_Ticker[0] = 0
+    return 0
+
 class ServerHandler(object):
-    def __init__(self, parent_thread_tid):
-        self.up      = 0
-        self.line    = None
-        self.thread  = parent_thread_tid
+    def __init__(self, conn, parent_thread_tid):
+        self.conn               = conn
+        self.up                 = 0
+        self.line               = None
+        self.thread             = parent_thread_tid
+        self.breakpoint_hit     = False
+        self.function_breaks    = set()
+        self.line_breaks        = set()
+        self.break_line_change  = None
 
     def __readlines(self, filename):
         fd = libc.open(filename,os.O_RDONLY)
@@ -94,8 +128,7 @@ class ServerHandler(object):
             co = f.f_code
             filename = co.co_filename
             name = co.co_name
-            #linecache.checkcache(filename)
-            line = self.__get_line(filename, lineno) #linecache.getline(filename, lineno, f.f_globals)
+            line = self.__get_line(filename, lineno)
             if line: line = line.strip()
             else: line = None
             ls.append((filename, lineno, name, line))
@@ -105,17 +138,8 @@ class ServerHandler(object):
         return traceback.format_list(ls)
 
     def __current_frames(self):
-        out = {}
         global debug__has_loaded_thread
-        ignored_thread = debug__has_loaded_thread
-        interp = ctypes.pythonapi.PyInterpreterState_Head()
-        t      = ctypes.pythonapi.PyInterpreterState_ThreadHead(interp)
-        while t != 0:
-            t_p = ctypes.cast(t,ctypes.POINTER(PyThreadState))[0]
-            if t_p.thread_id != _thread.get_ident() and t_p.thread_id != ignored_thread:
-                out[t_p.thread_id] = t_p.frame
-            t = ctypes.pythonapi.PyThreadState_Next(t)
-        return out
+        return dict([x for x in sys._current_frames().items() if x[0] != _thread.get_ident() and x[0] != debug__has_loaded_thread])
 
     def __get_frame(self):
         frame = self.__current_frames()[self.thread]
@@ -126,12 +150,13 @@ class ServerHandler(object):
         return frame
 
     def do0_bt(self):
-        """backtrace"""
+        """backtrace the current thread (as set by thr)"""
         stacks = self.__format_stack(self.__current_frames()[self.thread])
         stacks = ['%s%s'%(['  ','**'][len(stacks)-1-self.up==i], x[2:]) for i,x in enumerate(stacks)]
         return '\n'.join(stacks)
 
     def do1_bt(self, thread='*'):
+        """backtrace on all threads"""
         frames = self.__current_frames().items()
         result = ''
         for frame_i in frames:
@@ -141,19 +166,22 @@ class ServerHandler(object):
         return result
 
     def do2_bt(self, thread):
+        """backtrace on thread specified"""
         stacks = self.__format_stack(self.__current_frames()[int(thread)])
         stacks = [''.join(x) for i,x in enumerate(stacks)]
         return '\n'.join(stacks)
 
     def do_threads(self):
-        return '\n'.join( [str(x) for x in self.__current_frames().values()] )
+        """list al threads"""
+        return '\n'.join( [str(x[0]) for x in self.__current_frames().items()] )
 
     def do0_thr(self):
-        """Set / Get Thread"""
-        return self.thread
+        """Get currently selected thread"""
+        return str(self.thread)
 
     def do1_thr(self, thread):
-        frames = [str(x) for x in self.__current_frames().values()]
+        """Set currently selected thread"""
+        frames = [str(x[0]) for x in self.__current_frames().items()]
         if thread not in frames:
             return 'Error: No such thread'
         else:
@@ -163,6 +191,7 @@ class ServerHandler(object):
             return 'Switched to thread %s'%thread
 
     def do_up(self):
+        """Go up the stack (for locals/globals/list/etc)"""
         self.up += 1
         frame = self.__get_frame()
         if frame is None:
@@ -173,6 +202,7 @@ class ServerHandler(object):
             return '\n'.join(self.__format_stack(frame, 1))
 
     def do_down(self):
+        """Go down the stack (for locals/globals/list/etc)"""
         if self.up > 0:
             self.up -= 1
             frame = self.__get_frame()
@@ -197,6 +227,7 @@ class ServerHandler(object):
         return res
 
     def do_raise(self, exctype):
+        """Raise an exception of type `exctype` in the currently selected thread."""
         exctype_cls = self.__get_variable(exctype)
         if not inspect.isclass(exctype_cls):
             raise TypeError("Only types can be raised (not instances)")
@@ -209,16 +240,20 @@ class ServerHandler(object):
         return 'Asynchronously raising an exception of type %s'%exctype
 
     def do_p(self, variable):
+        """print the repr() of a (global or local or __builtins__) variable or a variables attribute."""
         return repr(self.__get_variable(variable))
 
     def do_dir(self, variable):
+        """get the list of attributes a particular variable has."""
         return repr(dir(self.__get_variable(variable)))
 
     def do_locals(self):
+        """List all local variables at the current frame position (up/down) in the current thread (thr)."""
         frame = self.__get_frame()
         return '\n'.join(frame.f_locals.keys())
 
     def do_globals(self):
+        """List all global variables seen by the current frame position (up/down) in the current thread (thr)."""
         frame = self.__get_frame()
         return '\n'.join(frame.f_globals.keys())
 
@@ -233,15 +268,131 @@ class ServerHandler(object):
             max_line_no = min(len(lines)-1,self.line+5)
         return ''.join(['%5i %s\n'%(i+1,lines[i]) for i in xrange(min_line_no,max_line_no)])[:-1]
     def do0_list(self, line='-'):
+        """List code just before the code that was last seen."""
         self.line = max(self.line-10,0)
         return self.__list()
     def do1_list(self):
+        """List code after what was last seen (or centered around current frame in current thread)."""
         frame = self.__get_frame()
-        self.line = frame.f_lineno
+        if self.line is None:
+            self.line = frame.f_lineno
+        else:
+            self.line += 10
         return self.__list()
     def do2_list(self, line):
+        """List code centered aronud specified line."""
         self.line = int(line)
         return self.__line()
+
+    def __setup_thread_tracer(self, setting):
+        if setting:
+            func = Py_tracefunc(breakpoint_tracer)
+            arg = self
+        else:
+            func = ctypes.cast(None, Py_tracefunc)
+            arg = ctypes.py_object()
+        global debug__has_loaded_thread
+        interp = ctypes.pythonapi.PyInterpreterState_Head()
+        t      = ctypes.pythonapi.PyInterpreterState_ThreadHead(interp)
+        while t != 0:
+            t_p = ctypes.cast(t,ctypes.POINTER(PyThreadState))
+            if t_p[0].thread_id != _thread.get_ident() and t_p[0].thread_id != debug__has_loaded_thread:
+                try:
+                    temp = t_p[0].c_traceobj
+                except ValueError:
+                    temp = None
+                if arg is not None: #Py_XINCREF
+                    #ctypes.pythonapi._Total
+                    refcount = ctypes.c_long.from_address(id(arg))
+                    refcount.value += 1
+                t_p[0].c_tracefunc = ctypes.cast(None, Py_tracefunc)
+                t_p[0].c_traceobj = ctypes.py_object()
+                t_p[0].use_tracing = int(t_p[0].c_profilefunc is not None)
+                if temp is not None: #Py_XDECREF
+                    refcount = ctypes.c_long.from_address(id(temp))
+                    refcount.value -= 1 #don't need to dealloc since we have a ref in here and it'll always be >0
+                t_p[0].c_tracefunc = func
+                t_p[0].c_traceobj  = arg
+                t_p[0].use_tracing = int((func is not None) or (t_p[0].c_profilefunc is not None))
+            t = ctypes.pythonapi.PyThreadState_Next(t)
+
+    def do_c(self):
+        """Continue execution of code (until breakpoint)."""
+        _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))
+        self.breakpoint_hit = False
+        try:
+            self.__setup_thread_tracer(True)
+            poll = select.poll()
+            poll.register(self.conn, select.POLLHUP|select.POLLERR)
+            while not self.breakpoint_hit and not only_thread():
+                ret = poll.poll(.3)
+                if len(ret) > 0:
+                    return 'hup'
+                _Py_Ticker[0] = 0    #switch to another thread
+                _Py_Ticker[0] = 1000 # make sure I have it long enough to check
+            _Py_Ticker[0] = 2**31-1
+            if self.breakpoint_hit:
+                ret = '\n'.join(self.__format_stack(self.breakpoint_hit, 1))
+                return ret
+            else:
+                return 'exit'
+        finally:
+            self.__setup_thread_tracer(False)
+
+    def do_step(self):
+        """Run code until another line is seen in the tracer (steps into functions)."""
+        frame    = self.__get_frame()
+        line     = frame.f_lineno
+        filename = frame.f_code.co_filename
+        self.break_line_change = (filename, line)
+        return self.do_c()
+
+    def do_break(self, label):
+        """Add a breakpoint (label can be of the forms: filename:lineno   lineno   function_name)."""
+        f = self.__get_frame()
+        lineno   = f.f_lineno
+        co       = f.f_code
+        filename = co.co_filename
+        name     = co.co_name
+        def isint(n):
+            try:
+                int(n)
+                return True
+            except:
+                return False
+        if label.find(':') >= 0:
+            fname, lineno = label.split(':')
+            self.line_breaks.add( (fname, int(lineno)) )
+        elif isint(label):
+            self.line_breaks.add( (filename, int(label)) )
+        else:
+            self.function_breaks.add(label)
+
+    def do0_help(self):
+        """List all available debugger functions."""
+        result = set()
+        items = sorted(dir(self))
+        for item in items:
+            _offset = item.find('_')
+            if item.startswith('do') and _offset > 0:
+                command = item[_offset+1:]
+                result.add(command)
+        return '  '.join(list(result))
+
+    def do1_help(self, command):
+        """List command choices and their associated arguments and documentation."""
+        items = sorted(dir(self))
+        result = []
+        for item in items:
+            if item.startswith('do') and item[-len(command)-1:] == '_%s'%command:
+                fn = getattr(self, item)
+                args, varargs, keywords, defaults = inspect.getargspec(fn)
+                pargs = [arg for arg in args[1:]]
+                if defaults is not None:
+                    for i, default in enumerate(reversed(defaults)):
+                        pargs[-i-1] = default
+                result.append("%s %s\n    %s\n"%(command, ' '.join(pargs), fn.__doc__ or ''))
+        return '\n'.join(result)
 
     def mux(self, command, *args_in):
         if command == 'exit':
@@ -265,41 +416,6 @@ class ServerHandler(object):
                             if good:
                                 return fn(*args_in)
 
-def tracefunc(state, frame, what, arg):
-    # details = (frame.f_code.co_filename,frame.f_lineno, frame.f_code.co_name)
-    sys.stdout.flush()
-    return 0
-
-def setup_thread_tracer(state, setting):
-    interp = ctypes.pythonapi.PyInterpreterState_Head()
-    t      = ctypes.pythonapi.PyInterpreterState_ThreadHead(interp)
-    while t != 0:
-        t_p = ctypes.cast(t,ctypes.POINTER(PyThreadState))[0]
-        if t_p.thread_id != _thread.get_ident() and t_p.thread_id != debug__has_loaded_thread:
-            if setting:
-                t_p.c_tracefunc = Py_tracefunc(tracefunc)
-                t_p.c_traceobj  = state
-                t_p.use_tracing = 1
-                t_p.tracing     = 0
-            else:
-                t_p.use_tracing = 0
-        t = ctypes.pythonapi.PyThreadState_Next(t)
-
-global __pydebug_breakpoint_hit
-
-def continue_threads(state):
-    global __pydebug_breakpoint_hit
-    _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))
-    __pydebug_breakpoint_hit = False
-    try:
-        setup_thread_tracer(state, True)
-        while not __pydebug_breakpoint_hit and not only_thread():
-            _Py_Ticker[0] = 0    #switch to another thread
-            _Py_Ticker[0] = 100
-        _Py_Ticker[0] = 2**31-1
-    finally:
-        setup_thread_tracer(state, False) # if connection breaks, I should call this too
-
 class pollfd(ctypes.Structure):
     _fields_ = [("fd",          ctypes.c_int),
                 ("events",      ctypes.c_short),
@@ -307,13 +423,13 @@ class pollfd(ctypes.Structure):
                 ]
 
 def handle_particular_user(conn,parent_thread,parent_thread_tid):
-    sh = ServerHandler(parent_thread_tid)
+    sh = ServerHandler(conn, parent_thread_tid)
     poll = pollfd()
     poll.fd      = conn.fileno()
     poll.events  = select.POLLIN
     poll.revents = select.POLLIN
     request_pending = ''
-    restored_sigint = ctypes.pythonapi.PyOS_setsig(signal.SIGINT, 1) # 1 == SIG_IGN
+    #restored_sigint = ctypes.pythonapi.PyOS_setsig(signal.SIGINT, 1) # 1 == SIG_IGN -- TODO handle signals correctly, right now this code would cause a segfault on closing
     _Py_Ticker = ctypes.cast(ctypes.pythonapi._Py_Ticker,ctypes.POINTER(ctypes.c_int))
     try:
         while not only_thread():
@@ -342,12 +458,14 @@ def handle_particular_user(conn,parent_thread,parent_thread_tid):
                     output = sh.mux(request['command'], *request['args'])
                 except:
                     output = traceback.format_exc()
+                if output == 'hup':
+                    return
                 out_enc = '%s\n'%base64.b64encode(pickle.dumps(output))
                 libc.send(conn.fileno(), ctypes.c_char_p(out_enc), len(out_enc))
                 if output == 'exit':
                     return
     finally:
-        ctypes.pythonapi.PyOS_setsig(signal.SIGINT, restored_sigint)
+        #ctypes.pythonapi.PyOS_setsig(signal.SIGINT, restored_sigint)
         _Py_Ticker[0] = 0 #yield to other threads
 
 # the only purpose this thread serves is to make sure that (static global int) _Py_TracingPossible in ceval.c is set to >= 1
@@ -409,7 +527,8 @@ class DebugShell(cmd.Cmd):
                     break
                 request_pending += data
         return pickle.loads(base64.b64decode(request_pending.split('\n')[0]))
-
+    def do_help(self, line):
+        self.default('help %s'%(line))
     def default(self, line):
         items = line.strip().split(' ')
         libc.printf(self.client_handle_request(*items))
