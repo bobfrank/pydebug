@@ -282,7 +282,7 @@ class ServerHandler(object):
     def do2_list(self, line):
         """List code centered aronud specified line."""
         self.line = int(line)
-        return self.__line()
+        return self.__list()
 
     def __setup_thread_tracer(self, setting):
         empty_obj = ctypes.py_object()
