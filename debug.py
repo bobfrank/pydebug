@@ -118,7 +118,11 @@ class ServerHandler(object):
         return file_data.split('\n') #TODO need to fix this to just extract the line(s) that are desired
 
     def __get_line(self, filename, lineno):
-        return self.__readlines(filename)[lineno-1]
+        data = self.__readlines(filename)
+        if lineno-1 < len(data):
+            return data[lineno-1]
+        else:
+            return '???'
 
     def __format_stack(self, f, limit = None):
         ls = []
