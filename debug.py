@@ -481,8 +481,9 @@ def ignored_tracing_thread(lock):
 def cmd_server(parent_thread, parent_thread_tid):
     mypid = os.getpid()
     path = '/tmp/py.debug.%s'%mypid
+    lock = threading.Lock()
+    lock.acquire()
     try:
-        lock = threading.Lock()
         igtt = threading.Thread(target=ignored_tracing_thread, args=(lock,))
         igtt.start()
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
